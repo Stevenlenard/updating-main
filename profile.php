@@ -1,70 +1,128 @@
 <?php
 require_once 'includes/config.php';
+if (session_status() !== PHP_SESSION_ACTIVE) session_start();
 
-// allow both admin and janitor; redirect to login if not logged in
+// redirect if not logged in
 if (!isLoggedIn()) {
     header('Location: user-login.php');
     exit;
 }
 
 $userid = getCurrentUserId();
-$role = 'janitor';
-if (isAdmin()) $role = 'admin';
+$role = isAdmin() ? 'admin' : 'janitor';
 
-// DEV mode to expose more info in responses (set false in production)
-if (!defined('DEV_MODE')) define('DEV_MODE', false);
+// Enable DEV_MODE while debugging. Set false in production.
+if (!defined('DEV_MODE')) define('DEV_MODE', true);
 
-// helper: escape output
+// escape helper
 function e($s) {
     return htmlspecialchars((string)$s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
-// Load user record from correct table
-$user = [
-    'first_name' => '',
-    'last_name' => '',
-    'email' => '',
-    'phone' => '',
-    'created_at' => '',
-];
-try {
+/**
+ * Try to detect which table and id column hold the user row.
+ * Returns array with keys: table, idField, row (assoc) on success, null on failure.
+ * Tries several common table and id field names so mismatches (admin vs admins / admin_id vs id) are handled.
+ */
+function detectUserRecord($userid, $role) {
+    global $pdo, $conn;
+    $candidates = [];
     if ($role === 'admin') {
-        if (isset($pdo) && $pdo instanceof PDO) {
-            $stmt = $pdo->prepare("SELECT * FROM admins WHERE admin_id = ? LIMIT 1");
-            $stmt->execute([$userid]);
-            $user = $stmt->fetch(PDO::FETCH_ASSOC) ?: $user;
-        } else {
-            $stmt = $conn->prepare("SELECT * FROM admins WHERE admin_id = ? LIMIT 1");
-            $stmt->bind_param("i", $userid);
-            $stmt->execute();
-            $res = $stmt->get_result();
-            $user = $res->fetch_assoc() ?: $user;
-            $stmt->close();
-        }
+        $candidates = [
+            ['table'=>'admins','id'=>'admin_id'],
+            ['table'=>'admin','id'=>'admin_id'],
+            ['table'=>'admins','id'=>'id'],
+            ['table'=>'admin','id'=>'id'],
+        ];
     } else {
-        if (isset($pdo) && $pdo instanceof PDO) {
-            $stmt = $pdo->prepare("SELECT * FROM janitors WHERE janitor_id = ? LIMIT 1");
-            $stmt->execute([$userid]);
-            $user = $stmt->fetch(PDO::FETCH_ASSOC) ?: $user;
-        } else {
-            $stmt = $conn->prepare("SELECT * FROM janitors WHERE janitor_id = ? LIMIT 1");
-            $stmt->bind_param("i", $userid);
-            $stmt->execute();
-            $res = $stmt->get_result();
-            $user = $res->fetch_assoc() ?: $user;
-            $stmt->close();
+        $candidates = [
+            ['table'=>'janitors','id'=>'janitor_id'],
+            ['table'=>'janitor','id'=>'janitor_id'],
+            ['table'=>'janitors','id'=>'id'],
+            ['table'=>'janitor','id'=>'id'],
+        ];
+    }
+
+    foreach ($candidates as $c) {
+        $table = $c['table'];
+        $idField = $c['id'];
+        try {
+            if (isset($pdo) && $pdo instanceof PDO) {
+                $stmt = $pdo->prepare("SELECT * FROM {$table} WHERE {$idField} = ? LIMIT 1");
+                if ($stmt === false) continue;
+                $stmt->execute([$userid]);
+                $row = $stmt->fetch(PDO::FETCH_ASSOC);
+                if ($row) return ['table'=>$table, 'idField'=>$idField, 'row'=>$row];
+            } elseif (isset($conn)) {
+                $stmt = $conn->prepare("SELECT * FROM {$table} WHERE {$idField} = ? LIMIT 1");
+                if (!$stmt) continue;
+                $stmt->bind_param("i", $userid);
+                $stmt->execute();
+                $res = $stmt->get_result();
+                $row = $res ? $res->fetch_assoc() : null;
+                $stmt->close();
+                if ($row) return ['table'=>$table, 'idField'=>$idField, 'row'=>$row];
+            }
+        } catch (Exception $ex) {
+            // ignore and try next candidate
+            error_log("[profile.php] detectUserRecord: probe {$table}.{$idField} failed: " . $ex->getMessage());
         }
     }
-} catch (Exception $e) {
-    error_log("[profile] failed to load user: " . $e->getMessage());
+    return null;
 }
 
-// Handle AJAX POST actions: update_profile, change_password
+// Helper: run count queries used by quick stats
+function runCountQuery($sql) {
+    global $pdo, $conn;
+    try {
+        if (isset($pdo) && $pdo instanceof PDO) {
+            $stmt = $pdo->query($sql);
+            if ($stmt === false) return null;
+            return (int)$stmt->fetchColumn();
+        } elseif (isset($conn)) {
+            $res = $conn->query($sql);
+            if ($res === false) return null;
+            $row = $res->fetch_row();
+            return (int)($row[0] ?? 0);
+        }
+    } catch (Exception $ex) {
+        error_log('[profile.php] runCountQuery error: ' . $ex->getMessage());
+    }
+    return null;
+}
+
+// Quick stats
+$totalBins = runCountQuery("SELECT COUNT(*) FROM bins");
+if ($totalBins === null) $totalBins = 0;
+
+$activeCandidates = [
+    "SELECT COUNT(*) FROM janitors WHERE is_active = 1",
+    "SELECT COUNT(*) FROM janitors WHERE active = 1",
+    "SELECT COUNT(*) FROM janitors WHERE status = 'active'",
+    "SELECT COUNT(*) FROM janitors WHERE status = 1",
+    "SELECT COUNT(*) FROM janitors"
+];
+$activeJanitors = null;
+foreach ($activeCandidates as $sql) {
+    $res = runCountQuery($sql);
+    if ($res !== null) { $activeJanitors = $res; break; }
+}
+if ($activeJanitors === null) $activeJanitors = 0;
+
+// Load user basic record (best-effort, for display)
+$user = ['first_name'=>'','last_name'=>'','email'=>'','phone'=>'','created_at'=>''];
+$detected = detectUserRecord($userid, $role);
+if ($detected) {
+    $user = $detected['row'] + $user;
+}
+
+// Handle AJAX actions
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
     header('Content-Type: application/json; charset=utf-8');
     $action = $_POST['action'] ?? '';
     try {
         if ($action === 'update_profile') {
+            // keep existing behavior (same as your prior code)
             $first_name = trim($_POST['first_name'] ?? '');
             $last_name  = trim($_POST['last_name'] ?? '');
             $email      = trim($_POST['email'] ?? '');
@@ -77,73 +135,58 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 throw new Exception('Invalid email address.');
             }
 
-            // check uniqueness within table
+            // uniqueness check and update (admin/janitor) — reuse your existing queries
             if ($role === 'admin') {
                 if (isset($pdo) && $pdo instanceof PDO) {
                     $stmt = $pdo->prepare("SELECT admin_id FROM admins WHERE email = ? AND admin_id != ? LIMIT 1");
                     $stmt->execute([$email, $userid]);
                     if ($stmt->fetch()) throw new Exception('Email already in use.');
+                    $stmt = $pdo->prepare("UPDATE admins SET first_name = :fn, last_name = :ln, email = :email, phone = :phone, updated_at = NOW() WHERE admin_id = :id");
+                    $stmt->execute([':fn'=>$first_name,':ln'=>$last_name,':email'=>$email,':phone'=>$phone,':id'=>$userid]);
                 } else {
                     $stmt = $conn->prepare("SELECT admin_id FROM admins WHERE email = ? AND admin_id != ? LIMIT 1");
-                    $stmt->bind_param("si", $email, $userid);
+                    $stmt->bind_param("si",$email,$userid);
                     $stmt->execute();
                     $res = $stmt->get_result();
-                    if ($res && $res->num_rows > 0) { $stmt->close(); throw new Exception('Email already in use.'); }
+                    if ($res && $res->num_rows>0) { $stmt->close(); throw new Exception('Email already in use.'); }
+                    $stmt->close();
+                    $stmt = $conn->prepare("UPDATE admins SET first_name = ?, last_name = ?, email = ?, phone = ?, updated_at = NOW() WHERE admin_id = ?");
+                    $stmt->bind_param("ssssi",$first_name,$last_name,$email,$phone,$userid);
+                    $stmt->execute();
+                    if ($stmt->errno) { $err=$stmt->error; $stmt->close(); throw new Exception('DB error: '.$err); }
                     $stmt->close();
                 }
             } else {
                 if (isset($pdo) && $pdo instanceof PDO) {
                     $stmt = $pdo->prepare("SELECT janitor_id FROM janitors WHERE email = ? AND janitor_id != ? LIMIT 1");
-                    $stmt->execute([$email, $userid]);
+                    $stmt->execute([$email,$userid]);
                     if ($stmt->fetch()) throw new Exception('Email already in use.');
+                    $stmt = $pdo->prepare("UPDATE janitors SET first_name = :fn, last_name = :ln, email = :email, phone = :phone, updated_at = NOW() WHERE janitor_id = :id");
+                    $stmt->execute([':fn'=>$first_name,':ln'=>$last_name,':email'=>$email,':phone'=>$phone,':id'=>$userid]);
                 } else {
                     $stmt = $conn->prepare("SELECT janitor_id FROM janitors WHERE email = ? AND janitor_id != ? LIMIT 1");
-                    $stmt->bind_param("si", $email, $userid);
+                    $stmt->bind_param("si",$email,$userid);
                     $stmt->execute();
                     $res = $stmt->get_result();
-                    if ($res && $res->num_rows > 0) { $stmt->close(); throw new Exception('Email already in use.'); }
+                    if ($res && $res->num_rows>0) { $stmt->close(); throw new Exception('Email already in use.'); }
                     $stmt->close();
-                }
-            }
-
-            // perform update
-            if ($role === 'admin') {
-                if (isset($pdo) && $pdo instanceof PDO) {
-                    $stmt = $pdo->prepare("UPDATE admins SET first_name = :fn, last_name = :ln, email = :email, phone = :phone, updated_at = NOW() WHERE admin_id = :id");
-                    $stmt->execute([':fn'=>$first_name, ':ln'=>$last_name, ':email'=>$email, ':phone'=>$phone, ':id'=>$userid]);
-                } else {
-                    $stmt = $conn->prepare("UPDATE admins SET first_name = ?, last_name = ?, email = ?, phone = ?, updated_at = NOW() WHERE admin_id = ?");
-                    $stmt->bind_param("ssssi", $first_name, $last_name, $email, $phone, $userid);
-                    $stmt->execute();
-                    if ($stmt->errno) {
-                        throw new Exception('DB error: ' . $stmt->error);
-                    }
-                    $stmt->close();
-                }
-            } else {
-                if (isset($pdo) && $pdo instanceof PDO) {
-                    $stmt = $pdo->prepare("UPDATE janitors SET first_name = :fn, last_name = :ln, email = :email, phone = :phone, updated_at = NOW() WHERE janitor_id = :id");
-                    $stmt->execute([':fn'=>$first_name, ':ln'=>$last_name, ':email'=>$email, ':phone'=>$phone, ':id'=>$userid]);
-                } else {
                     $stmt = $conn->prepare("UPDATE janitors SET first_name = ?, last_name = ?, email = ?, phone = ?, updated_at = NOW() WHERE janitor_id = ?");
-                    $stmt->bind_param("ssssi", $first_name, $last_name, $email, $phone, $userid);
+                    $stmt->bind_param("ssssi",$first_name,$last_name,$email,$phone,$userid);
                     $stmt->execute();
-                    if ($stmt->errno) {
-                        throw new Exception('DB error: ' . $stmt->error);
-                    }
+                    if ($stmt->errno) { $err=$stmt->error; $stmt->close(); throw new Exception('DB error: '.$err); }
                     $stmt->close();
                 }
             }
 
-            // update session display name if present
             if (session_status() !== PHP_SESSION_ACTIVE) session_start();
             $_SESSION['name'] = trim($first_name . ' ' . $last_name);
 
-            echo json_encode(['success' => true, 'message' => 'Profile updated successfully']);
+            echo json_encode(['success'=>true,'message'=>'Profile updated successfully']);
             exit;
         }
 
         if ($action === 'change_password') {
+            // Collect and validate input
             $current_password = trim($_POST['current_password'] ?? '');
             $new_password = trim($_POST['new_password'] ?? '');
             $confirm_password = trim($_POST['confirm_password'] ?? '');
@@ -158,48 +201,55 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 throw new Exception('New password must be at least 8 characters.');
             }
 
-            // fetch stored password
-            if ($role === 'admin') {
-                if (isset($pdo) && $pdo instanceof PDO) {
-                    $stmt = $pdo->prepare("SELECT password FROM admins WHERE admin_id = ? LIMIT 1");
-                    $stmt->execute([$userid]);
-                    $row = $stmt->fetch(PDO::FETCH_ASSOC);
-                } else {
-                    $stmt = $conn->prepare("SELECT password FROM admins WHERE admin_id = ? LIMIT 1");
-                    $stmt->bind_param("i", $userid);
-                    $stmt->execute();
-                    $res = $stmt->get_result();
-                    $row = $res ? $res->fetch_assoc() : null;
-                    $stmt->close();
-                }
-            } else {
-                if (isset($pdo) && $pdo instanceof PDO) {
-                    $stmt = $pdo->prepare("SELECT password FROM janitors WHERE janitor_id = ? LIMIT 1");
-                    $stmt->execute([$userid]);
-                    $row = $stmt->fetch(PDO::FETCH_ASSOC);
-                } else {
-                    $stmt = $conn->prepare("SELECT password FROM janitors WHERE janitor_id = ? LIMIT 1");
-                    $stmt->bind_param("i", $userid);
-                    $stmt->execute();
-                    $res = $stmt->get_result();
-                    $row = $res ? $res->fetch_assoc() : null;
-                    $stmt->close();
-                }
+            // DIAGNOSTICS container
+            $diag = [
+                'userid'=>$userid,
+                'role'=>$role,
+                'found_table'=>null,
+                'found_idField'=>null,
+                'stored_found'=>false,
+                'stored_len'=>null,
+                'verify_methods'=>[],
+                'db_prepare_ok'=>null,
+                'db_execute_ok'=>null,
+                'db_error'=>null,
+                'affected_rows'=>null,
+            ];
+
+            // Detect exact table/id that contain this user (handles admin vs admins, admin_id vs id)
+            $detected = detectUserRecord($userid, $role);
+            if (!$detected) {
+                throw new Exception('Unable to find your user row in admins/janitors tables. Table or id field may be different.');
             }
 
-            $stored = $row['password'] ?? '';
-            if ($stored === '') {
+            $table = $detected['table'];
+            $idField = $detected['idField'];
+            $diag['found_table'] = $table;
+            $diag['found_idField'] = $idField;
+            $stored = $detected['row']['password'] ?? '';
+
+            if ($stored !== '') {
+                $diag['stored_found'] = true;
+                $diag['stored_len'] = strlen($stored);
+            } else {
                 throw new Exception('Stored password not found for your account.');
             }
 
+            // Verify current password against common formats: password_verify (bcrypt/argon2), SHA-256 hex, MD5
             $verified = false;
-            // verify password (password_hash)
             if (password_verify($current_password, $stored)) {
                 $verified = true;
+                $diag['verify_methods'][] = 'password_verify';
             } else {
-                // legacy MD5 fallback
-                if (strlen($stored) === 32 && md5($current_password) === $stored) {
+                if (is_string($stored) && preg_match('/^[0-9a-f]{64}$/i', $stored)) {
+                    if (hash('sha256', $current_password) === $stored) {
+                        $verified = true;
+                        $diag['verify_methods'][] = 'sha256';
+                    }
+                }
+                if (!$verified && is_string($stored) && strlen($stored) === 32 && md5($current_password) === $stored) {
                     $verified = true;
+                    $diag['verify_methods'][] = 'md5';
                 }
             }
 
@@ -207,67 +257,73 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 throw new Exception('Current password is incorrect.');
             }
 
-            // hash new password
-            $newHash = password_hash($new_password, PASSWORD_DEFAULT);
-            if ($newHash === false) {
-                throw new Exception('Failed to hash password.');
+            // Hash new password using SHA-256 hex (per your request)
+            $newHash = hash('sha256', $new_password);
+            if ($newHash === '' || !preg_match('/^[0-9a-f]{64}$/i', $newHash)) {
+                throw new Exception('Failed to compute SHA-256 hash for new password.');
             }
+            $diag['new_hash_preview'] = substr($newHash,0,12) . '...';
 
-            // update DB with new hash and check affected rows
-            if ($role === 'admin') {
+            // Update the specific discovered table/idField
+            try {
                 if (isset($pdo) && $pdo instanceof PDO) {
-                    $stmt = $pdo->prepare("UPDATE admins SET password = :h, updated_at = NOW() WHERE admin_id = :id");
-                    $stmt->execute([':h' => $newHash, ':id' => $userid]);
-                    $affected = $stmt->rowCount();
-                    // rowCount may be 0 if same hash, but unlikely since password changed
-                } else {
-                    $stmt = $conn->prepare("UPDATE admins SET password = ?, updated_at = NOW() WHERE admin_id = ?");
-                    $stmt->bind_param("si", $newHash, $userid);
-                    $stmt->execute();
-                    if ($stmt->errno) {
-                        throw new Exception('DB error: ' . $stmt->error);
+                    $stmt = $pdo->prepare("UPDATE {$table} SET password = :h, updated_at = NOW() WHERE {$idField} = :id");
+                    $diag['db_prepare_ok'] = $stmt !== false;
+                    if ($stmt === false) {
+                        $diag['db_error'] = implode(' | ', $pdo->errorInfo());
+                        throw new Exception('DB prepare failed (PDO).');
                     }
-                    $affected = $conn->affected_rows;
+                    $ok = $stmt->execute([':h'=>$newHash, ':id'=>$userid]);
+                    $diag['db_execute_ok'] = (bool)$ok;
+                    if ($ok === false) {
+                        $diag['db_error'] = implode(' | ', $stmt->errorInfo());
+                        throw new Exception('DB execute failed (PDO).');
+                    }
+                    $diag['affected_rows'] = $stmt->rowCount();
+                } else {
+                    if (!isset($conn)) throw new Exception('No DB connection ($conn not set).');
+                    $stmt = $conn->prepare("UPDATE {$table} SET password = ?, updated_at = NOW() WHERE {$idField} = ?");
+                    $diag['db_prepare_ok'] = $stmt !== false;
+                    if (!$stmt) {
+                        $diag['db_error'] = $conn->error ?? 'mysqli prepare error';
+                        throw new Exception('DB prepare failed (mysqli).');
+                    }
+                    $stmt->bind_param("si", $newHash, $userid);
+                    $ok = $stmt->execute();
+                    $diag['db_execute_ok'] = (bool)$ok;
+                    if ($ok === false || $stmt->errno) {
+                        $diag['db_error'] = $stmt->error;
+                        $stmt->close();
+                        throw new Exception('DB execute failed (mysqli).');
+                    }
+                    $diag['affected_rows'] = $conn->affected_rows;
                     $stmt->close();
                 }
-            } else {
-                if (isset($pdo) && $pdo instanceof PDO) {
-                    $stmt = $pdo->prepare("UPDATE janitors SET password = :h, updated_at = NOW() WHERE janitor_id = :id");
-                    $stmt->execute([':h' => $newHash, ':id' => $userid]);
-                    $affected = $stmt->rowCount();
-                } else {
-                    $stmt = $conn->prepare("UPDATE janitors SET password = ?, updated_at = NOW() WHERE janitor_id = ?");
-                    $stmt->bind_param("si", $newHash, $userid);
-                    $stmt->execute();
-                    if ($stmt->errno) {
-                        throw new Exception('DB error: ' . $stmt->error);
-                    }
-                    $affected = $conn->affected_rows;
-                    $stmt->close();
-                }
+            } catch (Exception $ex) {
+                // Attach DB diag and rethrow to be returned to client
+                $diag['db_exception'] = $ex->getMessage();
+                throw new Exception('Failed to update password: ' . $ex->getMessage());
             }
 
-            if (empty($affected) && !$role) {
-                // shouldn't happen, but handle gracefully
-                throw new Exception('Password update did not affect any rows.');
-            }
-
-            echo json_encode(['success' => true, 'message' => 'Password updated successfully']);
+            $resp = ['success'=>true, 'message'=>'Password updated successfully'];
+            if (DEV_MODE) $resp['diag'] = $diag;
+            echo json_encode($resp);
             exit;
         }
 
         throw new Exception('Unknown action');
     } catch (Exception $e) {
-        // log detailed error for debugging
         error_log('[profile.php] action=' . ($action ?? '') . ' error: ' . $e->getMessage());
         $msg = $e->getMessage();
         if (!DEV_MODE) {
-            // hide technical details in production
             if ($action === 'change_password') $msg = 'Unable to update password. Please try again.';
             elseif ($action === 'update_profile') $msg = 'Unable to update profile. Please try again.';
+            else $msg = 'Request failed.';
         }
         http_response_code(400);
-        echo json_encode(['success' => false, 'message' => $msg]);
+        $out = ['success'=>false,'message'=>$msg];
+        if (DEV_MODE) $out['dev'] = true;
+        echo json_encode($out);
         exit;
     }
 }
@@ -381,11 +437,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
               <h6 class="stats-title">Quick Stats</h6>
               <div class="stat-item">
                 <span class="stat-label">Total Bins</span>
-                <span class="stat-value">48</span>
+                <span class="stat-value"><?php echo e($totalBins); ?></span>
               </div>
               <div class="stat-item">
                 <span class="stat-label">Active Janitors</span>
-                <span class="stat-value">12</span>
+                <span class="stat-value"><?php echo e($activeJanitors); ?></span>
               </div>
               <div class="stat-item">
                 <span class="stat-label">Member Since</span>
@@ -514,31 +570,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
   <script src="js/dashboard.js"></script>
   <script>
     document.addEventListener('DOMContentLoaded', function() {
-      // set displayed name/role already rendered server-side; no extra load needed
-
-      // Change photo button
-      document.getElementById('changePhotoBtn').addEventListener('click', function() {
-        document.getElementById('photoInput').click();
-      });
+      // Change photo
+      const changePhotoBtn = document.getElementById('changePhotoBtn');
+      if (changePhotoBtn) changePhotoBtn.addEventListener('click', () => document.getElementById('photoInput').click());
 
       // Toggle password visibility
       document.querySelectorAll('.password-toggle-btn').forEach(btn => {
         btn.addEventListener('click', function() {
           const input = document.querySelector(this.getAttribute('data-target'));
           const icon = this.querySelector('i');
+          if (!input) return;
           if (input.type === 'password') {
             input.type = 'text';
-            icon.classList.remove('fa-eye');
-            icon.classList.add('fa-eye-slash');
+            icon.classList.remove('fa-eye'); icon.classList.add('fa-eye-slash');
           } else {
             input.type = 'password';
-            icon.classList.remove('fa-eye-slash');
-            icon.classList.add('fa-eye');
+            icon.classList.remove('fa-eye-slash'); icon.classList.add('fa-eye');
           }
         });
       });
 
-      // Personal info update
+      // Personal info submit
       $('#personalInfoForm').on('submit', function(e) {
         e.preventDefault();
         $('#saveProfileBtn').prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin me-2"></i>Saving...');
@@ -546,7 +598,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         $.post('profile.php', data, function(resp) {
           if (resp && resp.success) {
             $('#personalInfoAlert').removeClass().addClass('alert alert-success').text(resp.message).show();
-            // update displayed name
             const newName = $('#firstName').val().trim() + ' ' + $('#lastName').val().trim();
             $('#profileName').text(newName);
           } else {
@@ -561,7 +612,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         });
       });
 
-      // Change password
+      // Change password submit
       $('#changePasswordForm').on('submit', function(e) {
         e.preventDefault();
         $('#changePasswordBtn').prop('disabled', true).html('<i class="fa-solid fa-spinner fa-spin me-2"></i>Updating...');
@@ -570,8 +621,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
           if (resp && resp.success) {
             $('#passwordAlert').removeClass().addClass('alert alert-success').text(resp.message).show();
             $('#changePasswordForm')[0].reset();
+            if (resp.diag) console.log('diag:', resp.diag);
           } else {
             $('#passwordAlert').removeClass().addClass('alert alert-danger').text(resp.message || 'Password change failed').show();
+            if (resp && resp.diag) console.log('diag error:', resp.diag);
           }
         }, 'json').fail(function(xhr){
           let msg = 'Server error';
@@ -583,14 +636,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
       });
     });
 
-    // show profile tab and set active menu item
     function showProfileTab(tabName, el) {
-      document.querySelectorAll('.tab-pane').forEach(tab => {
-        tab.classList.remove('show', 'active');
-      });
+      document.querySelectorAll('.tab-pane').forEach(tab => tab.classList.remove('show','active'));
       const tab = document.getElementById(tabName);
-      if (tab) tab.classList.add('show', 'active');
-
+      if (tab) tab.classList.add('show','active');
       document.querySelectorAll('.profile-menu-item').forEach(item => item.classList.remove('active'));
       if (el) el.classList.add('active');
     }

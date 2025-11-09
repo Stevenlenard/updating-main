@@ -112,7 +112,7 @@ function showAlert(containerId, message, type) {
   }, 5000)
 }
 
-// Admin Dashboard Data
+// Admin Dashboard Data (mock data kept for UI fallback; stats will come from server)
 const adminProfile = {
   name: "Admin User",
   email: "admin@example.com",
@@ -181,7 +181,7 @@ document.addEventListener("DOMContentLoaded", () => {
   console.log("[Admin] DOM Content Loaded - Initializing dashboard")
   initializeSidebar()
   initializeButtons()
-  loadDashboardData()
+  loadDashboardData()       // now fetches real counts
   loadBinsTable()
   loadJanitorsTable()
   loadNotifications()
@@ -591,17 +591,43 @@ function setupChangePasswordForm(form) {
   })
 }
 
-function loadDashboardData() {
-  const totalBinsEl = document.getElementById("totalBins")
-  const fullBinsEl = document.getElementById("fullBins")
-  const activeJanitorsEl = document.getElementById("activeJanitors")
-  const collectionsTodayEl = document.getElementById("collectionsToday")
+// ---- UPDATED: loadDashboardData now fetches real counts from server ----
+window.loadDashboardData = async function loadDashboardData() {
+  try {
+    const resp = await fetch('api/dashboard-stats.php', { cache: 'no-store' })
+    if (!resp.ok) {
+      console.error('Failed to fetch dashboard stats', resp.status)
+      // fallback to local mock values
+      const totalBinsEl = document.getElementById("totalBins")
+      const fullBinsEl = document.getElementById("fullBins")
+      const activeJanitorsEl = document.getElementById("activeJanitors")
+      const collectionsTodayEl = document.getElementById("collectionsToday")
+      if (totalBinsEl) totalBinsEl.textContent = bins.length
+      if (fullBinsEl) fullBinsEl.textContent = bins.filter((b) => b.status === "full").length
+      if (activeJanitorsEl) activeJanitorsEl.textContent = janitors.filter((j) => j.status === "active").length
+      if (collectionsTodayEl) collectionsTodayEl.textContent = Math.floor(Math.random() * 10) + 5
+      return
+    }
+    const data = await resp.json()
+    if (!data || !data.success) {
+      console.error('Dashboard stats response error', data && data.error)
+      return
+    }
 
-  if (totalBinsEl) totalBinsEl.textContent = bins.length
-  if (fullBinsEl) fullBinsEl.textContent = bins.filter((b) => b.status === "full").length
-  if (activeJanitorsEl) activeJanitorsEl.textContent = janitors.filter((j) => j.status === "active").length
-  if (collectionsTodayEl) collectionsTodayEl.textContent = Math.floor(Math.random() * 10) + 5
+    const setText = (id, value) => {
+      const el = document.getElementById(id)
+      if (el) el.textContent = String(value ?? 0)
+    }
+
+    setText('totalBins', data.totalBins ?? 0)
+    setText('fullBins', data.fullBins ?? 0)
+    setText('activeJanitors', data.activeJanitors ?? 0)
+    setText('collectionsToday', data.collectionsToday ?? data.totalCollections ?? 0)
+  } catch (err) {
+    console.error('Error loading dashboard data', err)
+  }
 }
+// ---- end updated loadDashboardData ----
 
 function loadBinsTable() {
   const tbody = document.getElementById("binsTableBody")
