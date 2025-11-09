@@ -1,0 +1,34 @@
+<?php
+require_once '../../includes/config.php';
+
+if (!isJanitor()) {
+    sendJSON(['success' => false, 'message' => 'Unauthorized']);
+}
+
+$janitor_id = getCurrentUserId();
+
+try {
+    $stmt = $pdo->prepare("
+        SELECT 
+            b.bin_id,
+            b.bin_code,
+            b.location,
+            b.type,
+            b.capacity,
+            b.status,
+            b.updated_at,
+            MAX(c.collected_at) as last_emptied
+        FROM bins b
+        LEFT JOIN collections c ON b.bin_id = c.bin_id AND c.janitor_id = ?
+        WHERE b.assigned_to = ?
+        GROUP BY b.bin_id
+        ORDER BY b.status DESC, b.capacity DESC
+    ");
+    $stmt->execute([$janitor_id, $janitor_id]);
+    $bins = $stmt->fetchAll();
+
+    sendJSON(['success' => true, 'bins' => $bins]);
+} catch (Exception $e) {
+    sendJSON(['success' => false, 'message' => $e->getMessage()]);
+}
+?>
