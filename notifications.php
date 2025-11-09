@@ -12,16 +12,12 @@ function e($s) {
 }
 
 /**
- * This notifications loader:
- * - Loads real notifications from notifications table if present
- * - Supplements with recent bins (created_at), janitor account events (created_at and updated_at)
- * - Supplements with recent contact messages (if a contacts/messages table exists)
- * - Uses created_at/updated_at timestamps from the source tables so times reflect real DB values
- * - Avoids assuming admin table column names
+ * Notifications loader with DB-backed notifications + fallback from bins/janitors/contact tables.
+ * Per-row action is "Read" which marks DB notification as read (or creates a read notification for synthetic entries).
  */
 
 // --------------------
-// AJAX action handlers (mark_read / mark_all_read / clear_all)
+// AJAX action handlers
 // --------------------
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
     header('Content-Type: application/json; charset=utf-8');
@@ -40,23 +36,76 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             exit;
         }
 
-        // Mark single notification as read
-        if ($action === 'mark_read' && isset($_POST['notification_id'])) {
-            $id = (int)$_POST['notification_id'];
-            if ($id <= 0) throw new Exception('Invalid notification id');
+        // Mark single notification as read or create+mark for synthetic items
+        if ($action === 'mark_read') {
+            // If notification_id provided -> update
+            if (!empty($_POST['notification_id'])) {
+                $id = (int)$_POST['notification_id'];
+                if ($id <= 0) throw new Exception('Invalid notification id');
+
+                if (isset($pdo) && $pdo instanceof PDO) {
+                    $stmt = $pdo->prepare("UPDATE notifications SET is_read = 1, read_at = NOW() WHERE notification_id = ?");
+                    $stmt->execute([$id]);
+                } else {
+                    $stmt = $conn->prepare("UPDATE notifications SET is_read = 1, read_at = NOW() WHERE notification_id = ?");
+                    if (!$stmt) throw new Exception($conn->error);
+                    $stmt->bind_param("i", $id);
+                    $stmt->execute();
+                    $stmt->close();
+                }
+
+                echo json_encode(['success' => true, 'message' => 'Notification marked as read', 'notification_id' => $id]);
+                exit;
+            }
+
+            // Otherwise client sent synthetic data (bin_id/janitor_id/title/message) -> insert notification marked read
+            $bin_id = isset($_POST['bin_id']) && $_POST['bin_id'] !== '' ? intval($_POST['bin_id']) : null;
+            $janitor_id = isset($_POST['janitor_id']) && $_POST['janitor_id'] !== '' ? intval($_POST['janitor_id']) : null;
+            $title = trim($_POST['title'] ?? '');
+            $message = trim($_POST['message'] ?? '');
+            $notification_type = $_POST['notification_type'] ?? 'info';
+            $creatorAdminId = getCurrentUserId() ?: null;
+
+            if (empty($title) && empty($message) && !$bin_id && !$janitor_id) {
+                throw new Exception('Missing data to create notification');
+            }
 
             if (isset($pdo) && $pdo instanceof PDO) {
-                $stmt = $pdo->prepare("UPDATE notifications SET is_read = 1, read_at = NOW() WHERE notification_id = ?");
-                $stmt->execute([$id]);
+                $stmt = $pdo->prepare("
+                    INSERT INTO notifications (admin_id, janitor_id, bin_id, notification_type, title, message, is_read, created_at, read_at)
+                    VALUES (:admin_id, :janitor_id, :bin_id, :type, :title, :message, 1, NOW(), NOW())
+                ");
+                $stmt->execute([
+                    ':admin_id' => $creatorAdminId,
+                    ':janitor_id' => $janitor_id,
+                    ':bin_id' => $bin_id,
+                    ':type' => $notification_type,
+                    ':title' => $title ?: ($bin_id ? "Bin #{$bin_id} activity" : 'Notification'),
+                    ':message' => $message ?: ''
+                ]);
+                $newId = (int)$pdo->lastInsertId();
             } else {
-                $stmt = $conn->prepare("UPDATE notifications SET is_read = 1, read_at = NOW() WHERE notification_id = ?");
+                if ($conn->query("SHOW TABLES LIKE 'notifications'")->num_rows === 0) {
+                    throw new Exception('notifications table not found');
+                }
+                $stmt = $conn->prepare("
+                    INSERT INTO notifications (admin_id, janitor_id, bin_id, notification_type, title, message, is_read, created_at, read_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 1, NOW(), NOW())
+                ");
                 if (!$stmt) throw new Exception($conn->error);
-                $stmt->bind_param("i", $id);
+                $adminParam = $creatorAdminId !== null ? (int)$creatorAdminId : null;
+                $janitorParam = $janitor_id !== null ? (int)$janitor_id : null;
+                $binParam = $bin_id !== null ? (int)$bin_id : null;
+                $typeParam = $notification_type;
+                $titleParam = $title ?: ($bin_id ? "Bin #{$bin_id} activity" : 'Notification');
+                $messageParam = $message ?: '';
+                $stmt->bind_param("iiisss", $adminParam, $janitorParam, $binParam, $typeParam, $titleParam, $messageParam);
                 $stmt->execute();
+                $newId = $stmt->insert_id;
                 $stmt->close();
             }
 
-            echo json_encode(['success' => true, 'message' => 'Notification marked as read', 'notification_id' => $id]);
+            echo json_encode(['success' => true, 'message' => 'Notification created and marked read', 'notification_id' => $newId]);
             exit;
         }
 
@@ -81,9 +130,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
 }
 
 // --------------------
-// Load notifications (and fallback recent bins/janitors/messages)
+// Load notifications and fallback (bins, janitors, contact messages)
 // --------------------
-$notifications = []; // unified list to render
+$notifications = []; // unified list
 
 function push_notification_array(&$list, $id, $type, $title, $message, $created_at, $is_read = 0, $admin_id = null, $janitor_id = null, $bin_id = null, $bin_code = null, $janitor_name = null) {
     $list[] = [
@@ -113,7 +162,7 @@ try {
         $hasNotificationsTable = ($r && $r->num_rows > 0);
     }
 
-    // 1) Load DB notifications (if table exists)
+    // 1) load DB notifications if exists
     if ($hasNotificationsTable) {
         if (isset($pdo) && $pdo instanceof PDO) {
             $stmt = $pdo->query("
@@ -137,7 +186,6 @@ try {
                 LIMIT 1000
             ");
             $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
-            // enrich with admin_name safely (avoid assuming admin columns in SQL)
             $adminStmt = $pdo->prepare("SELECT * FROM admins WHERE admin_id = ? LIMIT 1");
             foreach ($rows as $row) {
                 $row['admin_name'] = null;
@@ -158,7 +206,6 @@ try {
                 $notifications[] = $row;
             }
         } else {
-            // mysqli fallback
             $res = $conn->query("
                 SELECT
                     n.notification_id,
@@ -202,21 +249,19 @@ try {
         }
     }
 
-    // Build present ID sets (so synthetic fallback does not duplicate DB notifications)
+    // Build present sets
     $presentBins = [];
     $presentJanitors = [];
-    $presentMessages = []; // track message ids if notifications reference them in message text (best-effort)
-
+    $presentMessages = [];
     foreach ($notifications as $n) {
         if (!empty($n['bin_id'])) $presentBins[(int)$n['bin_id']] = true;
         if (!empty($n['janitor_id'])) $presentJanitors[(int)$n['janitor_id']] = true;
-        // attempt to fingerprint messages by title/message content (best-effort)
         if (!empty($n['title']) || !empty($n['message'])) {
             $presentMessages[md5(($n['title'] ?? '') . '::' . ($n['message'] ?? ''))] = true;
         }
     }
 
-    // 2) Recent bins (created_at) — include created_at time
+    // 2) recent bins
     if (isset($pdo) && $pdo instanceof PDO) {
         $stmt = $pdo->query("SELECT bin_id, bin_code, location, created_at FROM bins ORDER BY created_at DESC LIMIT 50");
         $bins = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -225,7 +270,6 @@ try {
         $res = $conn->query("SELECT bin_id, bin_code, location, created_at FROM bins ORDER BY created_at DESC LIMIT 50");
         if ($res) while ($r = $res->fetch_assoc()) $bins[] = $r;
     }
-
     foreach ($bins as $b) {
         $bid = (int)$b['bin_id'];
         $finger = md5("bin_created::" . ($b['bin_code'] ?? '') . '::' . ($b['created_at'] ?? ''));
@@ -236,19 +280,14 @@ try {
                 'new_bin',
                 "New bin added: " . ($b['bin_code'] ?? "Bin #{$bid}"),
                 "A new bin (" . ($b['bin_code'] ?? "Bin #{$bid}") . ")" . (!empty($b['location']) ? " at {$b['location']}" : "") . ".",
-                $b['created_at'] ?? null,
-                0,
-                null,
-                $bid,
-                $b['bin_code'] ?? null,
-                null
+                $b['created_at'] ?? null
             );
             $presentBins[$bid] = true;
             $presentMessages[$finger] = true;
         }
     }
 
-    // 3) Recent janitor accounts (created_at and updated_at)
+    // 3) recent janitors
     if (isset($pdo) && $pdo instanceof PDO) {
         $stmt = $pdo->query("SELECT janitor_id, first_name, last_name, email, created_at, updated_at FROM janitors ORDER BY GREATEST(created_at, IFNULL(updated_at, '1970-01-01')) DESC LIMIT 50");
         $janitors = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -257,55 +296,26 @@ try {
         $res = $conn->query("SELECT janitor_id, first_name, last_name, email, created_at, updated_at FROM janitors ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 50");
         if ($res) while ($r = $res->fetch_assoc()) $janitors[] = $r;
     }
-
     foreach ($janitors as $j) {
         $jid = (int)$j['janitor_id'];
         $full = trim(($j['first_name'] ?? '') . ' ' . ($j['last_name'] ?? ''));
         if ($full === '') $full = $j['email'] ?? "Janitor #{$jid}";
-
-        // created event
         $createdFinger = md5("janitor_created::{$jid}::" . ($j['created_at'] ?? ''));
         if (!isset($presentJanitors[$jid]) && !isset($presentMessages[$createdFinger])) {
-            push_notification_array(
-                $notifications,
-                null,
-                'new_janitor',
-                "New janitor account: " . $full,
-                "A new janitor account was created: " . $full . ".",
-                $j['created_at'] ?? null,
-                0,
-                null,
-                $jid,
-                null,
-                $full
-            );
+            push_notification_array($notifications, null, 'new_janitor', "New janitor account: " . $full, "A new janitor account was created: " . $full . ".", $j['created_at'] ?? null);
             $presentJanitors[$jid] = true;
             $presentMessages[$createdFinger] = true;
         }
-
-        // updated event (only if updated_at exists and differs)
         if (!empty($j['updated_at']) && $j['updated_at'] !== $j['created_at']) {
             $updatedFinger = md5("janitor_updated::{$jid}::" . ($j['updated_at'] ?? ''));
             if (!isset($presentMessages[$updatedFinger])) {
-                push_notification_array(
-                    $notifications,
-                    null,
-                    'warning',
-                    "Janitor profile updated: " . $full,
-                    "{$full} updated their profile.",
-                    $j['updated_at'] ?? null,
-                    0,
-                    null,
-                    $jid,
-                    null,
-                    $full
-                );
+                push_notification_array($notifications, null, 'warning', "Janitor profile updated: " . $full, "{$full} updated their profile.", $j['updated_at'] ?? null);
                 $presentMessages[$updatedFinger] = true;
             }
         }
     }
 
-    // 4) Recent contact/messages (support common table names)
+    // 4) common contact/message tables
     $messageTables = ['contact_messages', 'messages', 'contacts', 'inquiries', 'contact'];
     foreach ($messageTables as $tbl) {
         $exists = false;
@@ -317,7 +327,6 @@ try {
             $exists = ($r && $r->num_rows > 0);
         }
         if ($exists) {
-            // try to select common columns
             if (isset($pdo) && $pdo instanceof PDO) {
                 $stmt = $pdo->query("SELECT id, name, email, subject, message, created_at FROM {$tbl} ORDER BY created_at DESC LIMIT 50");
                 $msgs = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -326,35 +335,21 @@ try {
                 $res = $conn->query("SELECT id, name, email, subject, message, created_at FROM {$tbl} ORDER BY created_at DESC LIMIT 50");
                 if ($res) while ($r2 = $res->fetch_assoc()) $msgs[] = $r2;
             }
-
             foreach ($msgs as $m) {
                 $mid = $m['id'] ?? null;
                 $finger = md5("contact::" . ($m['subject'] ?? '') . '::' . ($m['message'] ?? '') . '::' . ($m['created_at'] ?? ''));
                 if (!isset($presentMessages[$finger])) {
                     $title = !empty($m['subject']) ? "Message: " . $m['subject'] : "New contact message from " . ($m['name'] ?? ($m['email'] ?? 'Guest'));
-                    $body = trim(($m['message'] ?? '') . ( !empty($m['email']) ? "\nFrom: {$m['email']}" : ''));
-                    push_notification_array(
-                        $notifications,
-                        null,
-                        'info',
-                        $title,
-                        $body,
-                        $m['created_at'] ?? null,
-                        0,
-                        null,
-                        null,
-                        null,
-                        $m['name'] ?? ($m['email'] ?? null)
-                    );
+                    $body = trim(($m['message'] ?? '') . (!empty($m['email']) ? "\nFrom: {$m['email']}" : ''));
+                    push_notification_array($notifications, null, 'info', $title, $body, $m['created_at'] ?? null);
                     $presentMessages[$finger] = true;
                 }
             }
-            // once we've used the first found contact table, break
             break;
         }
     }
 
-    // final sort by created_at desc
+    // sort by created_at desc
     usort($notifications, function($a, $b) {
         $ta = strtotime($a['created_at'] ?? '1970-01-01 00:00:00');
         $tb = strtotime($b['created_at'] ?? '1970-01-01 00:00:00');
@@ -365,10 +360,6 @@ try {
     error_log("[notifications] error loading notifications: " . $e->getMessage());
     $notifications = [];
 }
-
-// --------------------
-// Render HTML (table with per-row Read action)
-// --------------------
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -386,11 +377,31 @@ try {
 <body>
 <nav class="navbar navbar-expand-lg fixed-top">
   <div class="container-fluid">
-    <a class="navbar-brand" href="admin-dashboard.php"><span class="brand-circle me-2"><i class="fa-solid fa-trash-can"></i></span>Trashbin Admin</a>
+    <a class="navbar-brand" href="admin-dashboard.php">
+      <span class="brand-circle me-2"><i class="fa-solid fa-trash-can"></i></span>
+      <span class="d-none d-sm-inline">Trashbin Admin</span>
+    </a>
+    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#topNav">
+      <span class="navbar-toggler-icon"></span>
+    </button>
     <div class="collapse navbar-collapse" id="topNav">
-      <ul class="navbar-nav ms-auto">
-        <li class="nav-item"><a class="nav-link" href="profile.php"><i class="fa-solid fa-user me-1"></i>Profile</a></li>
-        <li class="nav-item"><a class="nav-link" href="logout.php"><i class="fa-solid fa-right-from-bracket me-1"></i>Logout</a></li>
+      <ul class="navbar-nav ms-auto align-items-lg-center">
+        <li class="nav-item me-2">
+          <a class="nav-link position-relative" href="notifications.php" title="Notifications">
+            <i class="fa-solid fa-bell"></i>
+            <span class="badge rounded-pill bg-danger position-absolute translate-middle" id="notificationCount" style="top:8px; left:18px; display:none;">0</span>
+          </a>
+        </li>
+        <li class="nav-item">
+          <a class="nav-link" href="profile.php" title="My Profile">
+            <i class="fa-solid fa-user me-1"></i><span class="d-none d-sm-inline">Profile</span>
+          </a>
+        </li>
+        <li class="nav-item">
+          <a class="nav-link" href="logout.php">
+            <i class="fa-solid fa-right-from-bracket me-1"></i><span class="d-none d-sm-inline">Logout</span>
+          </a>
+        </li>
       </ul>
     </div>
   </div>
@@ -399,8 +410,32 @@ try {
 <div id="notifToastContainer" aria-live="polite" aria-atomic="true"></div>
 
 <div class="dashboard">
-  <aside class="sidebar" id="sidebar"> 
-    <!-- sidebar omitted for brevity, keep your existing sidebar markup -->
+  <!-- Sidebar (restored full menu) -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header d-none d-md-block">
+      <h6 class="sidebar-title">Menu</h6>
+    </div>
+    <a href="admin-dashboard.php" class="sidebar-item">
+      <i class="fa-solid fa-chart-pie"></i><span>Dashboard</span>
+    </a>
+    <a href="bins.php" class="sidebar-item">
+      <i class="fa-solid fa-trash-alt"></i><span>Bins</span>
+    </a>
+    <a href="janitors.php" class="sidebar-item">
+      <i class="fa-solid fa-users"></i><span>Maintenance Staff</span>
+    </a>
+    <a href="reports.php" class="sidebar-item">
+      <i class="fa-solid fa-chart-line"></i><span>Reports</span>
+    </a>
+    <a href="notifications.php" class="sidebar-item active">
+      <i class="fa-solid fa-bell"></i><span>Notifications</span>
+    </a>
+    <a href="settings.php" class="sidebar-item">
+      <i class="fa-solid fa-gear"></i><span>Settings</span>
+    </a>
+    <a href="profile.php" class="sidebar-item">
+      <i class="fa-solid fa-user"></i><span>My Profile</span>
+    </a>
   </aside>
 
   <main class="content">
@@ -465,7 +500,7 @@ try {
                     <button class="btn btn-sm btn-success mark-read-btn" data-id="<?php echo $nid; ?>"><i class="fas fa-check me-1"></i>Read</button>
                   <?php elseif ($nid !== null && $isRead): ?>
                     <span class="text-muted small">Read</span>
-                  <?php else: /* synthetic entry: no notification_id */ ?>
+                  <?php else: ?>
                     <button class="btn btn-sm btn-success mark-read-btn" data-id="" data-bin-id="<?php echo e($n['bin_id'] ?? ''); ?>" data-janitor-id="<?php echo e($n['janitor_id'] ?? ''); ?>" data-title="<?php echo e($n['title'] ?? ''); ?>" data-message="<?php echo e($n['message'] ?? ''); ?>"><i class="fas fa-check me-1"></i>Read</button>
                   <?php endif; ?>
                 </td>
@@ -557,6 +592,7 @@ try {
     $.post('notifications.php', { action: 'mark_all_read' }, function (resp) {
       if (resp && resp.success) {
         $('#notificationsTableBody tr').each(function () {
+          const id = $(this).attr('data-id');
           $(this).addClass('table-light');
           $(this).find('.mark-read-btn').remove();
         });
