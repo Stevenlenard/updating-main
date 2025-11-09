@@ -79,7 +79,6 @@
     </section>
 
     <!-- Footer -->
-     <!-- Footer -->
     <div class="footer">
         <div class="footer-content">
       <div class="footer-links">
