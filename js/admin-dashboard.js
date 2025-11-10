@@ -1,3 +1,7 @@
+// js/admin-dashboard.js
+// Full admin dashboard JS (updated loadDashboardData included)
+// Replace your existing js/admin-dashboard.js with this file content.
+
 // Validation Rules
 const validationRules = {
   email: {
@@ -121,7 +125,7 @@ const adminProfile = {
   employeeId: "ADM-001",
 }
 
-const bins = [
+let bins = [
   {
     id: "BIN-001",
     location: "Main Street - Corner Store",
@@ -151,7 +155,7 @@ const bins = [
   },
 ]
 
-const janitors = [
+let janitors = [
   { id: 1, name: "John Doe", email: "john@example.com", phone: "+1 (555) 123-4567", bins: 5, status: "active" },
   { id: 2, name: "Jane Smith", email: "jane@example.com", phone: "+1 (555) 234-5678", bins: 4, status: "active" },
   { id: 3, name: "Bob Johnson", email: "bob@example.com", phone: "+1 (555) 345-6789", bins: 6, status: "inactive" },
@@ -591,42 +595,104 @@ function setupChangePasswordForm(form) {
   })
 }
 
-// ---- UPDATED: loadDashboardData now fetches real counts from server ----
+// ---- UPDATED: loadDashboardData with diagnostics and credentials ----
 window.loadDashboardData = async function loadDashboardData() {
-  try {
-    const resp = await fetch('api/dashboard-stats.php', { cache: 'no-store' })
-    if (!resp.ok) {
-      console.error('Failed to fetch dashboard stats', resp.status)
-      // fallback to local mock values
-      const totalBinsEl = document.getElementById("totalBins")
-      const fullBinsEl = document.getElementById("fullBins")
-      const activeJanitorsEl = document.getElementById("activeJanitors")
-      const collectionsTodayEl = document.getElementById("collectionsToday")
-      if (totalBinsEl) totalBinsEl.textContent = bins.length
-      if (fullBinsEl) fullBinsEl.textContent = bins.filter((b) => b.status === "full").length
-      if (activeJanitorsEl) activeJanitorsEl.textContent = janitors.filter((j) => j.status === "active").length
-      if (collectionsTodayEl) collectionsTodayEl.textContent = Math.floor(Math.random() * 10) + 5
-      return
-    }
-    const data = await resp.json()
-    if (!data || !data.success) {
-      console.error('Dashboard stats response error', data && data.error)
-      return
-    }
+  // Try these relative paths in order. Use 'test-db.php' first (you said that file works).
+  // If admin page is in a subfolder adjust the first path (e.g. '../test-db.php').
+  const endpoints = [
+    'test-db.php',                     // debug endpoint you confirmed works
+    'includes/get-dashboard-data.php', // production endpoint (recommended)
+    'api/get-dashboard-data.php',
+    'api/dashboard-stats.php'
+  ];
 
-    const setText = (id, value) => {
-      const el = document.getElementById(id)
-      if (el) el.textContent = String(value ?? 0)
-    }
+  const setText = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = String(value ?? 0);
+  };
 
-    setText('totalBins', data.totalBins ?? 0)
-    setText('fullBins', data.fullBins ?? 0)
-    setText('activeJanitors', data.activeJanitors ?? 0)
-    setText('collectionsToday', data.collectionsToday ?? data.totalCollections ?? 0)
-  } catch (err) {
-    console.error('Error loading dashboard data', err)
+  const setDebug = (msg) => {
+    console.log('[Dashboard debug]', msg);
+  };
+
+  for (const ep of endpoints) {
+    try {
+      setDebug(`Requesting ${ep}`);
+      const resp = await fetch(ep, { cache: 'no-store', credentials: 'same-origin' });
+      setDebug(`${ep} status ${resp.status}`);
+      if (!resp.ok) {
+        setDebug(`${ep} returned HTTP ${resp.status}`);
+        continue;
+      }
+
+      const text = await resp.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (e) {
+        // not JSON
+        setDebug(`${ep} response not JSON: ${text.substring(0,200)}`);
+        continue;
+      }
+      console.log('[Dashboard] response from', ep, data);
+
+      // Accept various response shapes:
+      // - test-db.php returns keys: totalBins, fullBins, activeJanitors, collectionsToday (we saw that)
+      // - includes/get-dashboard-data.php or api endpoints return success:true and same keys
+      if (data.success === false || (data.success === undefined && data.ok === false)) {
+        setDebug(`${ep} returned error or missing success/ok`);
+        continue;
+      }
+
+      // pick values from multiple possible key names
+      const totalBins = data.totalBins ?? data.total_bins ?? data.totalBinsCount ?? data.totalBinsCount ?? data.total_bins_count ?? data.totalCollections ?? data.totalBins ?? 0;
+      const fullBins = data.fullBins ?? data.full_bins ?? data.full_bins_count ?? 0;
+      const activeJanitors = data.activeJanitors ?? data.active_janitors ?? data.active_janitors_count ?? data.activeJanitors ?? 0;
+      const collectionsToday = data.collectionsToday ?? data.collections_today ?? data.collectionsTodayCount ?? data.collectionsToday ?? 0;
+
+      setText('totalBins', totalBins);
+      setText('fullBins', fullBins);
+      setText('activeJanitors', activeJanitors);
+      setText('collectionsToday', collectionsToday);
+
+      // update bins table if returned
+      if (Array.isArray(data.bins)) {
+        try {
+          window.bins = data.bins.map((b) => ({
+            id: b.id ?? b.bin_code ?? b.bin_id,
+            location: b.location ?? '',
+            type: b.type ?? '',
+            status: b.status ?? '',
+            lastEmptied: b.last_emptied ?? b.lastEmptied ?? '',
+            capacity: b.capacity ? (String(b.capacity).includes('%') ? String(b.capacity) : (String(b.capacity) + '%')) : '',
+            assignedTo: b.assigned_to_name ?? b.assigned_to ?? ''
+          }));
+          if (typeof loadBinsTable === 'function') loadBinsTable();
+          if (typeof loadAllBinsTable === 'function') loadAllBinsTable();
+        } catch (e) {
+          console.warn('Error updating bins table', e);
+        }
+      }
+
+      setDebug(`Loaded dashboard data from ${ep}`);
+      return;
+    } catch (err) {
+      console.error('Error requesting', ep, err);
+      setDebug(`Fetch error for ${ep}: ${err.message}`);
+    }
   }
-}
+
+  // fallback -> mock values (non-destructive)
+  setDebug('No API endpoint responded correctly — using mock UI fallback');
+  const totalBinsEl = document.getElementById("totalBins");
+  const fullBinsEl = document.getElementById("fullBins");
+  const activeJanitorsEl = document.getElementById("activeJanitors");
+  const collectionsTodayEl = document.getElementById("collectionsToday");
+  if (totalBinsEl) totalBinsEl.textContent = bins.length;
+  if (fullBinsEl) fullBinsEl.textContent = bins.filter((b) => b.status === "full").length;
+  if (activeJanitorsEl) activeJanitorsEl.textContent = janitors.filter((j) => j.status === "active").length;
+  if (collectionsTodayEl) collectionsTodayEl.textContent = Math.floor(Math.random() * 10) + 5;
+};
 // ---- end updated loadDashboardData ----
 
 function loadBinsTable() {

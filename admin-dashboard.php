@@ -967,6 +967,6 @@ if (!isAdmin()) {
   <script src="js/bootstrap.bundle.min.js"></script>
   <script src="js/database.js"></script>
   <script src="js/admin-dashboard.js"></script>
-  <script src="js/dashboard.js"></script>
+
 </body>
 </html>
