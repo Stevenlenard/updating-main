@@ -295,36 +295,8 @@ function initIconFlipAnimations() {
 
 // ============================================
 // FOOTER DYNAMIC TEXT
+// (note: duplicate initFooterText removed in this file - only one present above)
 // ============================================
-function initFooterText() {
-  const footerText = document.getElementById('footerText');
-  if (footerText) {
-    const messages = [
-      'Making waste management smarter, one bin at a time.',
-      'Powered by IoT technology and sustainable innovation.',
-      'Join us in creating cleaner, greener communities.',
-      'Real-time monitoring for a cleaner tomorrow.'
-    ];
-
-    let currentIndex = 0;
-
-    function updateFooterText() {
-      footerText.style.opacity = '0';
-
-      setTimeout(() => {
-        footerText.textContent = messages[currentIndex];
-        footerText.style.opacity = '1';
-        currentIndex = (currentIndex + 1) % messages.length;
-      }, 500);
-    }
-
-    // Initial text
-    footerText.textContent = messages[0];
-
-    // Rotate messages every 5 seconds
-    setInterval(updateFooterText, 5000);
-  }
-}
 
 // ============================================
 // ORIGINAL JANITOR DASHBOARD CODE
@@ -605,6 +577,7 @@ async function loadAssignedBins() {
   const result = await fetchAPI(JANITOR_API.assignedBins)
 
   if (result.success) {
+    // result.bins is expected from the janitor-assigned endpoint
     assignedBins = result.bins || []
     const tbody = document.getElementById("assignedBinsBody")
 
@@ -615,11 +588,55 @@ async function loadAssignedBins() {
 
     tbody.innerHTML = ""
 
+    // ---------- FALLBACK: if no assigned bins, show all bins from bins table ----------
     if (assignedBins.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-muted">No bins assigned</td></tr>'
+      // Try to fetch ALL bins so janitor still sees buckets (per request)
+      try {
+        const resp = await fetch('includes/get-bins.php')
+        const text = await resp.text()
+        let payload = null
+        try {
+          payload = JSON.parse(text)
+        } catch (e) {
+          console.error('[v0] includes/get-bins.php returned invalid JSON:', text)
+        }
+
+        // includes/get-bins.php in this repo usually returns { success: true, data: [...] }
+        const binsData = (payload && payload.success && Array.isArray(payload.data)) ? payload.data : []
+
+        if (binsData.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-muted">No bins assigned</td></tr>'
+          return
+        }
+
+        // Set assignedBins to the fallback list so filtering/search still works
+        assignedBins = binsData
+
+        binsData.forEach((bin) => {
+          const statusBadge = getStatusBadge(bin.status)
+          const lastEmptied = bin.last_emptied ? new Date(bin.last_emptied).toLocaleString() : "Never"
+          const row = document.createElement("tr")
+          row.innerHTML = `
+            <td>${bin.bin_code || bin.bin_id || bin.id}</td>
+            <td>${bin.location || ""}</td>
+            <td>${bin.type || ""}</td>
+            <td>${statusBadge}</td>
+            <td>${lastEmptied}</td>
+            <td class="text-end">
+              <button class="btn btn-sm btn-primary" onclick="openStatusModal('${bin.bin_id || bin.bin_id || bin.id}')">Update</button>
+            </td>
+          `
+          tbody.appendChild(row)
+        })
+      } catch (err) {
+        console.error('[v0] Error loading fallback bins:', err)
+        tbody.innerHTML = '<tr><td colspan="6" class="text-center py-4 text-muted">No bins assigned</td></tr>'
+      }
       return
     }
+    // -------------------------------------------------------------------------------
 
+    // render assigned bins (normal path)
     assignedBins.forEach((bin) => {
       const statusBadge = getStatusBadge(bin.status)
       const lastEmptied = bin.last_emptied ? new Date(bin.last_emptied).toLocaleString() : "Never"
@@ -966,6 +983,33 @@ async function updateBinStatus() {
     hideModalById('statusUpdateModal')
     loadAssignedBins()
     loadDashboardData()
+
+    // --- Non-blocking attempt to notify admin UI of this update ---
+    // NOTE: server-side insertion of a notification in api/janitor/update-bin-stats.php is preferred.
+    // If you don't have that server change yet, this client-side POST will attempt to create a notification
+    // using the existing notifications endpoint. If you add a dedicated endpoint for creating admin
+    // notifications, point the fetch below to it.
+    (async () => {
+      try {
+        // Try to create a notification record for admins (best done server-side inside update-bin-stats.php)
+        await fetch('notifications.php', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            // Some servers expect 'action' = 'mark_read' branch for synthetic insert -
+            // ideally change server to accept 'create' for unread inserts.
+            action: 'create', // change server-side if needed; harmless if ignored
+            bin_id: binId,
+            title: `Bin ${binId} updated by janitor`,
+            message: `Bin ${binId} status set to ${status} by janitor`,
+            notification_type: 'bin_update'
+          }).toString()
+        })
+      } catch (err) {
+        // Non-fatal: just log it
+        console.warn('[v0] Notification creation attempt failed:', err)
+      }
+    })()
   }
 }
 

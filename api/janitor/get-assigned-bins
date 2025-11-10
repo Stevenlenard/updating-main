@@ -1,34 +1,171 @@
 <?php
 require_once '../../includes/config.php';
 
-if (!isJanitor()) {
+// Endpoint: api/janitor/get-assigned-bins.php
+// - Returns bins assigned to the current janitor (if janitor user).
+// - If the janitor has no assigned bins, returns all bins (same list as admin's bins.php).
+// - Admins can optionally pass ?janitor_id=NN to view a specific janitor's assigned bins.
+// Response: JSON { success: true, bins: [ ... ] }
+
+// Require at least a logged-in user (janitor or admin). Adjust as needed.
+if (!isLoggedIn()) {
     sendJSON(['success' => false, 'message' => 'Unauthorized']);
 }
 
-$janitor_id = getCurrentUserId();
-
 try {
-    $stmt = $pdo->prepare("
-        SELECT 
-            b.bin_id,
-            b.bin_code,
-            b.location,
-            b.type,
-            b.capacity,
-            b.status,
-            b.updated_at,
-            MAX(c.collected_at) as last_emptied
-        FROM bins b
-        LEFT JOIN collections c ON b.bin_id = c.bin_id AND c.janitor_id = ?
-        WHERE b.assigned_to = ?
-        GROUP BY b.bin_id
-        ORDER BY b.status DESC, b.capacity DESC
-    ");
-    $stmt->execute([$janitor_id, $janitor_id]);
-    $bins = $stmt->fetchAll();
+    $requestedJanitor = null;
+
+    // If current user is a janitor, prefer their id.
+    if (isJanitor()) {
+        $requestedJanitor = getCurrentUserId();
+    } elseif (isAdmin() && isset($_GET['janitor_id'])) {
+        // Admin can optionally request a specific janitor's bins
+        $requestedJanitor = intval($_GET['janitor_id']);
+        if ($requestedJanitor <= 0) $requestedJanitor = null;
+    }
+
+    $bins = [];
+
+    // Use PDO path if available
+    if (isset($pdo) && $pdo instanceof PDO) {
+        if ($requestedJanitor) {
+            $stmt = $pdo->prepare("
+                SELECT 
+                    b.bin_id,
+                    b.bin_code,
+                    b.location,
+                    b.type,
+                    b.capacity,
+                    b.status,
+                    b.assigned_to,
+                    CONCAT(j.first_name, ' ', j.last_name) AS assigned_to_name,
+                    MAX(c.collected_at) AS last_emptied,
+                    b.latitude,
+                    b.longitude,
+                    b.installation_date,
+                    b.created_at,
+                    b.updated_at
+                FROM bins b
+                LEFT JOIN janitors j ON b.assigned_to = j.janitor_id
+                LEFT JOIN collections c ON b.bin_id = c.bin_id
+                WHERE b.assigned_to = ?
+                GROUP BY b.bin_id
+                ORDER BY b.created_at DESC
+            ");
+            $stmt->execute([$requestedJanitor]);
+            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            if ($rows && count($rows) > 0) {
+                foreach ($rows as $r) $bins[] = $r;
+            }
+        }
+
+        // If janitor had no assigned bins (or no requestedJanitor), return all bins as fallback
+        if (empty($bins)) {
+            $stmtAll = $pdo->query("
+                SELECT 
+                    b.bin_id,
+                    b.bin_code,
+                    b.location,
+                    b.type,
+                    b.capacity,
+                    b.status,
+                    b.assigned_to,
+                    CONCAT(j.first_name, ' ', j.last_name) AS assigned_to_name,
+                    MAX(c.collected_at) AS last_emptied,
+                    b.latitude,
+                    b.longitude,
+                    b.installation_date,
+                    b.created_at,
+                    b.updated_at
+                FROM bins b
+                LEFT JOIN janitors j ON b.assigned_to = j.janitor_id
+                LEFT JOIN collections c ON b.bin_id = c.bin_id
+                GROUP BY b.bin_id
+                ORDER BY b.created_at DESC
+            ");
+            $bins = $stmtAll->fetchAll(PDO::FETCH_ASSOC);
+        }
+    }
+    // mysqli path
+    elseif (isset($conn)) {
+        if ($requestedJanitor) {
+            $stmt = $conn->prepare("
+                SELECT 
+                    b.bin_id,
+                    b.bin_code,
+                    b.location,
+                    b.type,
+                    b.capacity,
+                    b.status,
+                    b.assigned_to,
+                    CONCAT(j.first_name, ' ', j.last_name) AS assigned_to_name,
+                    MAX(c.collected_at) AS last_emptied,
+                    b.latitude,
+                    b.longitude,
+                    b.installation_date,
+                    b.created_at,
+                    b.updated_at
+                FROM bins b
+                LEFT JOIN janitors j ON b.assigned_to = j.janitor_id
+                LEFT JOIN collections c ON b.bin_id = c.bin_id
+                WHERE b.assigned_to = ?
+                GROUP BY b.bin_id
+                ORDER BY b.created_at DESC
+            ");
+            if ($stmt) {
+                $stmt->bind_param("i", $requestedJanitor);
+                $stmt->execute();
+                $res = $stmt->get_result();
+                while ($row = $res->fetch_assoc()) $bins[] = $row;
+                $stmt->close();
+            }
+        }
+
+        if (empty($bins)) {
+            $query = "
+                SELECT 
+                    b.bin_id,
+                    b.bin_code,
+                    b.location,
+                    b.type,
+                    b.capacity,
+                    b.status,
+                    b.assigned_to,
+                    CONCAT(j.first_name, ' ', j.last_name) AS assigned_to_name,
+                    MAX(c.collected_at) AS last_emptied,
+                    b.latitude,
+                    b.longitude,
+                    b.installation_date,
+                    b.created_at,
+                    b.updated_at
+                FROM bins b
+                LEFT JOIN janitors j ON b.assigned_to = j.janitor_id
+                LEFT JOIN collections c ON b.bin_id = c.bin_id
+                GROUP BY b.bin_id
+                ORDER BY b.created_at DESC
+            ";
+            $resAll = $conn->query($query);
+            if ($resAll) {
+                while ($r = $resAll->fetch_assoc()) $bins[] = $r;
+            }
+        }
+    } else {
+        // No DB connection available
+        sendJSON(['success' => false, 'message' => 'Database connection not available']);
+    }
+
+    // Normalize/ensure types for client
+    foreach ($bins as &$b) {
+        // ensure numeric ids are numbers (not strings)
+        if (isset($b['bin_id'])) $b['bin_id'] = (int)$b['bin_id'];
+        if (isset($b['capacity'])) $b['capacity'] = is_numeric($b['capacity']) ? (int)$b['capacity'] : $b['capacity'];
+        if (!isset($b['assigned_to'])) $b['assigned_to'] = null;
+    }
 
     sendJSON(['success' => true, 'bins' => $bins]);
+    exit;
 } catch (Exception $e) {
-    sendJSON(['success' => false, 'message' => $e->getMessage()]);
+    error_log("[api/janitor/get-assigned-bins] Exception: " . $e->getMessage());
+    sendJSON(['success' => false, 'message' => 'Failed to load bins']);
+    exit;
 }
-?>
